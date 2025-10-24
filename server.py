@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from functools import wraps
+from queue import Queue, Empty
 
 # --- config.py ---
 
@@ -124,12 +125,14 @@ class KeyPool:
         self._keys: List[APIKey] = []
         self._current_index: int = 0
         self._lock = threading.Lock()
+        self._queue: Queue[APIKey] = Queue()
         self._load_keys()
 
     def _load_keys(self):
         try:
             raw_keys = key_manager.get_keys()
-            self._keys = []
+            new_keys: List[APIKey] = []
+            new_queue: Queue[APIKey] = Queue()
             for i, key_id in enumerate(raw_keys):
                 key_value = key_manager.get_key_by_index(i)
                 if key_value:
@@ -138,22 +141,42 @@ class KeyPool:
                         value=key_value,
                         created_at=datetime.utcnow()
                     )
-                    self._keys.append(api_key)
-            logger_pool.info(f"Loaded {len(self._keys)} keys into pool")
+                    new_keys.append(api_key)
+                    new_queue.put(api_key)
+
+            with self._lock:
+                self._keys = new_keys
+                self._queue = new_queue
+                self._current_index = 0
+
+            logger_pool.info(f"Loaded {len(new_keys)} keys into pool")
         except Exception as e:
             logger_pool.error(f"Failed to load keys into pool: {e}")
-            self._keys = []
+            with self._lock:
+                self._keys = []
+                self._queue = Queue()
+                self._current_index = 0
 
     def get_next_key(self) -> Optional[APIKey]:
         with self._lock:
             if not self._keys:
                 logger_pool.warning("No keys available in pool")
                 return None
-            current_key = self._keys[self._current_index]
+
+            try:
+                current_key = self._queue.get_nowait()
+            except Empty:
+                logger_pool.warning("Key queue empty")
+                return None
+
             current_key.last_used = datetime.utcnow()
             current_key.usage_count += 1
-            self._current_index = (self._current_index + 1) % len(self._keys)
-            logger_pool.debug(f"Selected key {current_key.id}, usage count: {current_key.usage_count}")
+            self._queue.put(current_key)
+            if self._keys:
+                self._current_index = (self._current_index + 1) % len(self._keys)
+            logger_pool.debug(
+                f"Selected key {current_key.id}, usage count: {current_key.usage_count}"
+            )
             return current_key
 
 
@@ -179,10 +202,8 @@ class KeyPool:
             }
 
     def reload_keys(self):
-        with self._lock:
-            logger_pool.info("Reloading keys into pool")
-            self._load_keys()
-            self._current_index = 0
+        logger_pool.info("Reloading keys into pool")
+        self._load_keys()
 
 key_pool = KeyPool()
 

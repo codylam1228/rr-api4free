@@ -10,15 +10,15 @@ FastAPI service that hands out OpenRouter API keys in a round-robin cycle. Drop 
 
 ```
 FreeAPI/
-├── openrouter.example/ (.exmaple need to be removed )
+├── openrouter.example/
 │   └── keys.ini
 ├── server.py
 ├── test.py
 ├── README.md
-├── pyproject.toml
+└── pyproject.toml
 ```
 
-> Only `openrouter/keys.ini` is required at runtime. `openrouter.example/` is a template you can copy or rename into place.
+> Only `openrouter/keys.ini` is required at runtime. `openrouter.example/` is a template you can copy or rename into place. The .exmaple need to be removed
 
 ---
 
