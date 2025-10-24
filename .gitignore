@@ -1,0 +1,21 @@
+
+# uv 
+.venv/
+uv.lock
+.python-version
+
+
+# python 
+__pycache__/
+
+# .env
+.env
+
+# keys.txt
+keys.txt
+
+# spec workflow
+.spec-workflow/
+
+# openrouter/
+openrouter/

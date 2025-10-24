@@ -1,0 +1,15 @@
+[project]
+name = "freeapi"
+version = "0.1.0"
+description = "Free API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.104.1",
+    "openai>=1.109.1",
+    "pydantic==2.5.0",
+    "python-dotenv==1.0.0",
+    "python-multipart==0.0.6",
+    "requests>=2.32.5",
+    "uvicorn==0.24.0",
+]
