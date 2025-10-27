@@ -27,6 +27,7 @@ FreeAPI/
 - Rotate through throwaway keys so rate limits and bans are spread evenly.
 - Single self-contained `server.py`—no extra modules to hunt down.
 - Production-ready Python client with caching, retries, circuit breaker, and metrics helpers.
+- **NEW**: OpenAI-compatible proxy - use with any OpenAI SDK client!
 
 ---
 
@@ -56,12 +57,21 @@ FreeAPI/
 
 ## API Overview
 
+### Internal API (Key Management)
+
 | Method | Path                  | Description                       |
 |--------|-----------------------|-----------------------------------|
 | GET    | `/`                   | Basic service metadata            |
 | GET    | `/api/v1/keys/next`   | Fetch next key in rotation        |
 | GET    | `/api/v1/health`      | Lightweight health indicator      |
 | GET    | `/api/v1/stats`       | Pool statistics and usage counts  |
+
+### OpenAI-Compatible Proxy (for end users)
+
+| Method | Path                     | Description                              |
+|--------|--------------------------|------------------------------------------|
+| POST   | `/v1/chat/completions`   | OpenAI-compatible chat completions       |
+| GET    | `/v1/models`             | List available models                    |
 
 ### Response Samples
 
@@ -91,6 +101,67 @@ FreeAPI/
   ]
 }
 ```
+
+---
+
+## Using the OpenAI-Compatible Proxy
+
+The proxy allows you to use the standard OpenAI Python SDK (or any OpenAI-compatible client) while automatically rotating through your OpenRouter keys.
+
+### Step 1: Generate a Proxy API Key
+
+Run the key generator script:
+```bash
+uv run generate_proxy_key.py
+```
+
+This will create a proxy token like `freeapi-XXXXXXXX...` and save it to `openrouter/proxy_tokens.ini`.
+
+### Step 2: Use with OpenAI SDK
+
+Update your code to point to the local proxy:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8964/v1",
+    api_key="freeapi-XXXXXXXX..."  # Your generated proxy key
+)
+
+completion = client.chat.completions.create(
+    model="x-ai/grok-4-fast:free",
+    messages=[
+        {"role": "user", "content": "Hello!"}
+    ]
+)
+
+print(completion.choices[0].message.content)
+```
+
+### Benefits
+
+- **Zero Code Changes**: Works with existing OpenAI SDK code
+- **Automatic Key Rotation**: The proxy handles round-robin distribution
+- **Authentication**: Each user gets their own proxy token
+- **Transparent**: Responses are identical to OpenRouter's format
+- **Multiple Users**: Generate multiple proxy keys for different users/apps
+
+### Example: Remote Access
+
+If running on a server, replace `localhost` with your server's IP/domain:
+
+```python
+client = OpenAI(
+    base_url="https://your-domain.com/v1",
+    api_key="freeapi-XXXXXXXX..."
+)
+```
+
+**Note**: Make sure to:
+1. Keep your OpenRouter keys in `openrouter/keys.ini` (server-side)
+2. Only share proxy keys (from `openrouter/proxy_tokens.ini`) with users
+3. Never share your actual OpenRouter keys
 
 ---
 

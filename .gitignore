@@ -19,3 +19,7 @@ keys.txt
 
 # openrouter/
 openrouter/
+
+# .cursor
+.cursor/
+AGENTS.md

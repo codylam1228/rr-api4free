@@ -8,9 +8,11 @@ import threading
 import logging
 import time
 import requests
+import secrets
+import hashlib
 from typing import List, Optional, Dict, Any, Callable
 from datetime import datetime
-from fastapi import FastAPI, APIRouter, HTTPException, status
+from fastapi import FastAPI, APIRouter, HTTPException, status, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
@@ -25,6 +27,7 @@ class Config:
     SERVICE_PORT: int = 8964
     LOG_LEVEL: str = "INFO"
     KEYS_FILE = "./openrouter/keys.ini"
+    PROXY_TOKENS_FILE = "./openrouter/proxy_tokens.ini"
 
     @classmethod
     def get_api_keys(cls) -> List[str]:
@@ -54,6 +57,73 @@ class Config:
 
 config = Config()
 
+# --- Proxy Authentication System ---
+class ProxyAuth:
+    """Manages proxy authentication tokens"""
+    
+    def __init__(self, tokens_file: str = None):
+        self.tokens_file = tokens_file or config.PROXY_TOKENS_FILE
+        self._tokens: set = set()
+        self._lock = threading.Lock()
+        self._load_tokens()
+    
+    def _load_tokens(self):
+        """Load proxy tokens from file"""
+        if not os.path.exists(self.tokens_file):
+            # Create file with a default token
+            os.makedirs(os.path.dirname(self.tokens_file), exist_ok=True)
+            default_token = self.generate_token()
+            with open(self.tokens_file, "w", encoding="utf-8") as f:
+                f.write(f"# Proxy API tokens - one per line\n")
+                f.write(f"# Generated default token:\n")
+                f.write(f"{default_token}\n")
+            print(f"Created {self.tokens_file} with default token: {default_token}")
+            self._tokens.add(default_token)
+            return
+        
+        with self._lock:
+            self._tokens.clear()
+            with open(self.tokens_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("freeapi-"):
+                        self._tokens.add(line)
+            print(f"Loaded {len(self._tokens)} proxy tokens from {self.tokens_file}")
+    
+    def generate_token(self) -> str:
+        """Generate a new proxy token"""
+        random_part = secrets.token_urlsafe(48)
+        return f"freeapi-{random_part}"
+    
+    def validate_token(self, token: str) -> bool:
+        """Validate if a token is authorized"""
+        with self._lock:
+            return token in self._tokens
+    
+    def add_token(self, token: str = None) -> str:
+        """Add a new token to the authorized list"""
+        if token is None:
+            token = self.generate_token()
+        
+        with self._lock:
+            self._tokens.add(token)
+        
+        # Append to file
+        with open(self.tokens_file, "a", encoding="utf-8") as f:
+            f.write(f"{token}\n")
+        
+        print(f"Added new proxy token: {token}")
+        return token
+    
+    def reload_tokens(self):
+        """Reload tokens from file"""
+        print("Reloading proxy tokens")
+        self._load_tokens()
+
+proxy_auth = ProxyAuth()
+
 # --- models.py ---
 class APIKey(BaseModel):
     id: int = Field(..., description="Unique identifier for the key")
@@ -80,6 +150,21 @@ class ErrorResponse(BaseModel):
     error: str = Field(..., description="Error message")
     detail: Optional[str] = Field(None, description="Additional error details")
     timestamp: datetime = Field(default_factory=datetime.utcnow, description="Error timestamp")
+
+# --- OpenAI-compatible Models ---
+class ChatMessage(BaseModel):
+    role: str
+    content: Any  # Can be string or list of content parts
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = None
+    top_p: Optional[float] = 1.0
+    frequency_penalty: Optional[float] = 0.0
+    presence_penalty: Optional[float] = 0.0
+    stream: Optional[bool] = False
 
 # --- key_manager.py ---
 logger = logging.getLogger("key_manager")
@@ -517,6 +602,160 @@ async def get_stats():
             detail="Internal server error"
         )
 
+# --- Proxy Routes (OpenAI-compatible) ---
+proxy_router = APIRouter()
+proxy_logger = logging.getLogger("proxy")
+
+async def verify_proxy_auth(authorization: str = Header(None)):
+    """Verify proxy authentication token"""
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authorization header"
+        )
+    
+    # Extract token from "Bearer <token>"
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format"
+        )
+    
+    token = parts[1]
+    if not proxy_auth.validate_token(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key"
+        )
+    
+    return token
+
+@proxy_router.post("/chat/completions")
+async def proxy_chat_completions(
+    request: ChatCompletionRequest,
+    authorization: str = Header(None)
+):
+    """
+    OpenAI-compatible chat completions endpoint
+    Proxies requests to OpenRouter using the key pool
+    """
+    # Verify authentication
+    await verify_proxy_auth(authorization)
+    
+    # Get a key from the pool
+    api_key_obj = key_pool.get_next_key()
+    if api_key_obj is None:
+        proxy_logger.error("No API keys available in pool")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No API keys available"
+        )
+    
+    real_api_key = api_key_obj.value
+    
+    # Prepare request to OpenRouter
+    headers = {
+        "Authorization": f"Bearer {real_api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": f"http://{config.SERVICE_HOST}:{config.SERVICE_PORT}",
+        "X-Title": "FreeAPI Proxy"
+    }
+    
+    # Build request body
+    body = {
+        "model": request.model,
+        "messages": [msg.dict() for msg in request.messages],
+        "temperature": request.temperature,
+        "stream": request.stream
+    }
+    
+    if request.max_tokens is not None:
+        body["max_tokens"] = request.max_tokens
+    if request.top_p is not None:
+        body["top_p"] = request.top_p
+    if request.frequency_penalty is not None:
+        body["frequency_penalty"] = request.frequency_penalty
+    if request.presence_penalty is not None:
+        body["presence_penalty"] = request.presence_penalty
+    
+    proxy_logger.info(f"Proxying request to OpenRouter with model: {request.model}")
+    
+    try:
+        # Forward request to OpenRouter
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=body,
+            timeout=60
+        )
+        
+        response_data = response.json()
+        
+        # Check if OpenRouter returned an error
+        if response.status_code != 200 or "error" in response_data:
+            error_msg = response_data.get("error", {})
+            if isinstance(error_msg, dict):
+                error_detail = error_msg.get("message", str(error_msg))
+                error_code = error_msg.get("code", response.status_code)
+            else:
+                error_detail = str(error_msg)
+                error_code = response.status_code
+            
+            proxy_logger.error(f"OpenRouter error: {error_detail}")
+            raise HTTPException(
+                status_code=error_code if isinstance(error_code, int) else response.status_code,
+                detail=f"OpenRouter API error: {error_detail}"
+            )
+        
+        # Return the successful response
+        return response_data
+        
+    except HTTPException:
+        raise
+    except requests.exceptions.RequestException as e:
+        proxy_logger.error(f"Error forwarding request to OpenRouter: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to connect to OpenRouter: {str(e)}"
+        )
+
+@proxy_router.get("/models")
+async def proxy_list_models(authorization: str = Header(None)):
+    """
+    OpenAI-compatible models endpoint
+    """
+    # Verify authentication
+    await verify_proxy_auth(authorization)
+    
+    # Get a key from the pool
+    api_key_obj = key_pool.get_next_key()
+    if api_key_obj is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No API keys available"
+        )
+    
+    real_api_key = api_key_obj.value
+    
+    headers = {
+        "Authorization": f"Bearer {real_api_key}",
+    }
+    
+    try:
+        response = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers=headers,
+            timeout=30
+        )
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        proxy_logger.error(f"Error fetching models: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to fetch models: {str(e)}"
+        )
+
 # --- main.py ---
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
@@ -570,6 +809,7 @@ app.add_middleware(
 )
 
 app.include_router(router, prefix="/api/v1", tags=["API Keys"])
+app.include_router(proxy_router, prefix="/v1", tags=["OpenAI Proxy"])
 
 @app.get("/")
 async def root():
